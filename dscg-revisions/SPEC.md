@@ -26,6 +26,11 @@ ajouter, renommer, supprimer des chapitres.
 Chaque chapitre a un statut : **Non vu**, **En cours**, **Acquis**, **À revoir**.
 La progression d'une UE est la part de chapitres « Acquis ».
 
+Un chapitre peut être découpé en **sous-chapitres** (un seul niveau). Il devient alors
+un regroupement repliable : son statut et ses révisions passent à ses sous-chapitres,
+qui comptent chacun dans la progression. Les actions d'édition (ajouter, renommer,
+supprimer) apparaissent via le bouton « Modifier ».
+
 ### 2. Révision espacée
 - Passer un chapitre en « Acquis » programme une première révision à J+1.
 - Lors d'une révision : « Je maîtrise » passe à l'intervalle suivant
