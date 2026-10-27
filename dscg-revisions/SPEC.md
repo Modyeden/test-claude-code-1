@@ -31,6 +31,14 @@ un regroupement repliable : son statut et ses révisions passent à ses sous-cha
 qui comptent chacun dans la progression. Les actions d'édition (ajouter, renommer,
 supprimer) apparaissent via le bouton « Modifier ».
 
+### Fiche d'un chapitre
+Un appui sur le titre d'un chapitre ou d'un sous-chapitre ouvre sa fiche :
+- **Observations** : texte libre, enregistré automatiquement pendant la saisie.
+- **Images** : photos, schémas ou captures, compressées à l'ajout (1600 px max) et
+  stockées dans IndexedDB. Un appui agrandit l'image ; suppression en deux appuis.
+- La liste signale les chapitres qui ont des observations ou des images.
+- L'export JSON inclut les images ; supprimer un chapitre supprime ses images.
+
 ### 2. Révision espacée
 - Passer un chapitre en « Acquis » programme une première révision à J+1.
 - Lors d'une révision : « Je maîtrise » passe à l'intervalle suivant

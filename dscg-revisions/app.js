@@ -16,6 +16,8 @@ const ICONS = {
   trash: '<path d="M5 7h14"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
+  back: '<path d="M15 6l-6 6 6 6"/>',
+  note: '<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13h7M9 17h5"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -116,7 +118,7 @@ function esc(str) {
 
 // ---------- Données ----------
 
-const newItem = (title) => ({ id: uid(), title, status: "nonvu", step: 0, nextReview: "", children: [] });
+const newItem = (title) => ({ id: uid(), title, status: "nonvu", step: 0, nextReview: "", notes: "", imageCount: 0, children: [] });
 
 function defaultState() {
   return {
@@ -131,16 +133,84 @@ function defaultState() {
   };
 }
 
-// Les sauvegardes antérieures aux sous-chapitres n'ont pas de tableau `children`.
+// Complète les sauvegardes créées avant l'ajout des sous-chapitres et des observations.
 function normalize(data) {
+  const fill = (item) => {
+    item.notes = item.notes || "";
+    item.imageCount = item.imageCount || 0;
+  };
   for (const ue of data.ues) {
     for (const ch of ue.chapters) {
+      fill(ch);
       ch.children = ch.children || [];
-      for (const sub of ch.children) sub.children = [];
+      for (const sub of ch.children) {
+        fill(sub);
+        sub.children = [];
+      }
     }
   }
   return data;
 }
+
+// ---------- Images (IndexedDB) ----------
+// Les images sont trop lourdes pour localStorage : elles vivent dans IndexedDB,
+// rattachées à un chapitre par `chapterId`.
+
+const dbPromise = new Promise((resolve, reject) => {
+  const req = indexedDB.open("dscg-revisions", 1);
+  req.onupgradeneeded = () => {
+    const store = req.result.createObjectStore("images", { keyPath: "id" });
+    store.createIndex("chapterId", "chapterId");
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+
+function imageStore(mode, fn) {
+  return dbPromise.then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction("images", mode);
+    const result = fn(tx.objectStore("images"));
+    tx.oncomplete = () => resolve(result && "result" in result ? result.result : undefined);
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+const imagesFor = (chapterId) => imageStore("readonly", (s) => s.index("chapterId").getAll(chapterId));
+const allImages = () => imageStore("readonly", (s) => s.getAll());
+const putImage = (img) => imageStore("readwrite", (s) => s.put(img));
+const deleteImage = (id) => imageStore("readwrite", (s) => s.delete(id));
+const clearImages = () => imageStore("readwrite", (s) => s.clear());
+
+async function deleteImagesFor(chapterIds) {
+  for (const id of chapterIds) {
+    for (const img of await imagesFor(id)) await deleteImage(img.id);
+  }
+}
+
+// Réduit les photos (souvent 4000 px sur iPhone) avant de les enregistrer.
+function compressImage(file, maxSize = 1600) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("compression"))), "image/jpeg", 0.82);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("lecture")); };
+    img.src = url;
+  });
+}
+
+const blobToDataUrl = (blob) => new Promise((resolve) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(reader.result);
+  reader.readAsDataURL(blob);
+});
 
 function load() {
   try {
@@ -168,6 +238,9 @@ let editMode = false;
 let inlineEdit = null;
 // Bouton de suppression en attente d'un second appui de confirmation.
 let pendingConfirm = null;
+// Chapitre dont la fiche (observations et images) est ouverte.
+let currentDetail = null;
+let galleryUrls = [];
 const openGroups = new Set();
 
 const findUe = (code) => state.ues.find((u) => u.code === code);
@@ -280,8 +353,8 @@ function viewDashboard() {
   const dueRows = due.map((f) => `
     <li class="item">
       ${statusDot(f.ch.status)}
-      <div class="title"><span class="ue">${f.ue.code}</span> ${esc(label(f))}
-        ${f.ch.nextReview < today ? `<small class="late">Prévue le ${formatDate(f.ch.nextReview, false)}</small>` : ""}</div>
+      <button class="title title-btn" data-open="${f.ch.id}"><span class="ue">${f.ue.code}</span> ${esc(label(f))}
+        ${f.ch.nextReview < today ? `<small class="late">Prévue le ${formatDate(f.ch.nextReview, false)}</small>` : ""}${attachmentHint(f.ch)}</button>
       <div class="actions">
         <button class="btn" data-review="${f.ch.id}" data-ok="1">Je maîtrise</button>
         <button class="btn ghost" data-review="${f.ch.id}" data-ok="0">À retravailler</button>
@@ -292,7 +365,7 @@ function viewDashboard() {
   const planRows = state.planning[dayIdx]
     .map(findItem)
     .filter(Boolean)
-    .map((f) => `<li class="item">${statusDot(f.ch.status)}<div class="title"><span class="ue">${f.ue.code}</span> ${esc(label(f))}</div></li>`)
+    .map((f) => `<li class="item">${statusDot(f.ch.status)}<button class="title title-btn" data-open="${f.ch.id}"><span class="ue">${f.ue.code}</span> ${esc(label(f))}${attachmentHint(f.ch)}</button></li>`)
     .join("");
 
   return `
@@ -345,12 +418,20 @@ function inlineForm(type, ch) {
 
 const isEditing = (type, ch) => inlineEdit && inlineEdit.type === type && inlineEdit.id === ch.id;
 
+// Rappelle sous le titre ce que contient la fiche du chapitre.
+function attachmentHint(ch) {
+  const parts = [];
+  if (ch.notes.trim()) parts.push("Observations");
+  if (ch.imageCount) parts.push(`${ch.imageCount} image${ch.imageCount > 1 ? "s" : ""}`);
+  return parts.length ? `<span class="hint">${icon("note")}${parts.join(" · ")}</span>` : "";
+}
+
 function leafRow(ch, parent) {
   if (isEditing("rename", ch)) return inlineForm("rename", ch);
   return `<li class="item${parent ? " sub" : ""}">
     ${statusDot(ch.status)}
-    <div class="title">${esc(ch.title)}
-      ${ch.nextReview ? `<small>Révision le ${formatDate(ch.nextReview, false)}</small>` : ""}</div>
+    <button class="title title-btn" data-open="${ch.id}" aria-label="Ouvrir la fiche de ${esc(ch.title)}">${esc(ch.title)}
+      ${ch.nextReview ? `<small>Révision le ${formatDate(ch.nextReview, false)}</small>` : ""}${attachmentHint(ch)}</button>
     ${editMode ? editActions(ch, parent) : `<select class="status" data-status="${ch.id}" aria-label="Statut de ${esc(ch.title)}">
       ${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}" ${k === ch.status ? "selected" : ""}>${v}</option>`).join("")}
     </select>`}
@@ -364,15 +445,69 @@ function groupRow(ch) {
     <details data-group="${ch.id}" ${openGroups.has(ch.id) ? "open" : ""}>
       <summary class="item"${isEditing("rename", ch) ? " hidden" : ""}>
         <span class="chevron">${icon("chevron")}</span>
-        <div class="title">${esc(ch.title)}</div>
-        ${editMode ? editActions(ch, null) : `<span class="muted num">${done}/${ch.children.length}</span>`}
+        <div class="title">${esc(ch.title)}${attachmentHint(ch)}</div>
+        ${editMode ? editActions(ch, null) : `<span class="muted num">${done}/${ch.children.length}</span>
+          <button class="icon-btn" data-open="${ch.id}" aria-label="Ouvrir la fiche de ${esc(ch.title)}">${icon("note")}</button>`}
       </summary>
       <ul class="list">${ch.children.map((sub) => leafRow(sub, ch)).join("")}${isEditing("sub", ch) ? inlineForm("sub", ch) : ""}</ul>
     </details>
   </li>`;
 }
 
+function viewDetail(found) {
+  const { ue, ch, parent } = found;
+  const done = ch.children.filter((c) => c.status === "acquis").length;
+  const statusControl = isLeaf(ch)
+    ? `<label class="row-field"><span class="muted">Statut</span>
+        <select class="status" data-status="${ch.id}">
+          ${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}" ${k === ch.status ? "selected" : ""}>${v}</option>`).join("")}
+        </select></label>
+       ${ch.nextReview ? `<p class="muted">Prochaine révision le ${formatDate(ch.nextReview)}</p>` : ""}`
+    : `<p class="muted">${done} sous-chapitre${done > 1 ? "s" : ""} acquis sur ${ch.children.length}</p>`;
+
+  return `
+    <button class="back" data-back="1">${icon("back")}${ue.code}${parent ? ` · ${esc(parent.title)}` : ""}</button>
+    <section>
+      <h2 class="detail-title">${esc(ch.title)}</h2>
+      ${statusControl}
+    </section>
+    <section>
+      <div class="panel-head"><h2><label for="notes">Observations</label></h2><span class="muted save-state" id="save-state" aria-live="polite"></span></div>
+      <textarea id="notes" data-notes="${ch.id}" rows="6" placeholder="Points clés, pièges, références d'articles, questions à reposer…">${esc(ch.notes)}</textarea>
+    </section>
+    <section>
+      <div class="panel-head">
+        <h2>Images</h2>
+        <button class="btn ghost" data-pick-images="1">${icon("plus")}Ajouter</button>
+        <input type="file" id="image-input" data-add-images="${ch.id}" accept="image/*" multiple hidden>
+      </div>
+      <div class="gallery" id="gallery" data-chapter="${ch.id}"><p class="muted">Chargement…</p></div>
+    </section>`;
+}
+
+async function loadGallery() {
+  const el = document.getElementById("gallery");
+  if (!el) return;
+  const chapterId = el.dataset.chapter;
+  const images = (await imagesFor(chapterId)).sort((a, b) => a.createdAt - b.createdAt);
+  // La vue a pu changer pendant la lecture.
+  if (document.getElementById("gallery") !== el) return;
+  galleryUrls.forEach((u) => URL.revokeObjectURL(u));
+  galleryUrls = images.map((img) => URL.createObjectURL(img.blob));
+  el.innerHTML = images.length
+    ? images.map((img, i) => `<figure>
+        <button class="thumb" data-view-image="${galleryUrls[i]}" aria-label="Agrandir l'image ${i + 1}"><img src="${galleryUrls[i]}" alt="Image ${i + 1}"></button>
+        ${deleteButton("del-image", img.id, `l'image ${i + 1}`)}
+      </figure>`).join("")
+    : '<p class="muted">Ajoutez des photos de cours, schémas ou captures d\'écran liés à cette partie.</p>';
+}
+
 function viewUe() {
+  if (currentDetail) {
+    const found = findItem(currentDetail);
+    if (found) return viewDetail(found);
+    currentDetail = null;
+  }
   const ue = findUe(currentUe);
   const items = leaves(ue);
   const p = progress(items);
@@ -508,15 +643,47 @@ function viewSettings() {
 const VIEWS = { dashboard: viewDashboard, ue: viewUe, annales: viewAnnales, planning: viewPlanning, settings: viewSettings };
 
 function render() {
+  // Garde la position de lecture : la galerie se recharge de façon asynchrone.
+  const scrollY = window.scrollY;
   document.getElementById("page-title").textContent = TAB_TITLES[currentTab];
   document.getElementById("view").innerHTML = VIEWS[currentTab]();
+  window.scrollTo(0, scrollY);
   document.querySelectorAll(".tabs button").forEach((b) => {
     const active = b.dataset.tab === currentTab;
     b.classList.toggle("active", active);
     if (active) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   });
+  if (currentTab === "ue" && currentDetail) loadGallery().then(() => window.scrollTo(0, scrollY));
 }
+
+function openDetail(id) {
+  const found = findItem(id);
+  if (!found) return;
+  currentTab = "ue";
+  currentUe = found.ue.code;
+  currentDetail = id;
+  editMode = false;
+  inlineEdit = null;
+  if (found.parent) openGroups.add(found.parent.id);
+  window.scrollTo(0, 0);
+  render();
+}
+
+function closeDetail() {
+  const id = currentDetail;
+  currentDetail = null;
+  render();
+  // Revient à la ligne du chapitre dans la liste.
+  const row = view.querySelector(`[data-open="${id}"]`);
+  if (row) row.scrollIntoView({ block: "center" });
+}
+
+const lightbox = document.getElementById("lightbox");
+lightbox.addEventListener("click", (e) => {
+  // Un appui hors de l'image ou sur « Fermer » referme la visionneuse.
+  if (e.target === lightbox || e.target.closest("[data-close]")) lightbox.close();
+});
 
 // ---------- Événements ----------
 
@@ -524,11 +691,12 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-tab]");
   if (!btn) return;
   currentTab = btn.dataset.tab;
+  currentDetail = null;
   editMode = false;
   inlineEdit = null;
   pendingConfirm = null;
-  render();
   window.scrollTo(0, 0);
+  render();
 });
 
 const view = document.getElementById("view");
@@ -552,7 +720,10 @@ view.addEventListener("click", (e) => {
 
   // Les suppressions demandent un second appui : le bouton devient « Supprimer ? ».
   const hadPending = pendingConfirm;
-  const confirmKey = d.delete ? `delete:${d.delete}` : d.delAnnale ? `del-annale:${d.delAnnale}` : t.id === "reset" ? "reset" : null;
+  const confirmKey = d.delete ? `delete:${d.delete}`
+    : d.delAnnale ? `del-annale:${d.delAnnale}`
+    : d.delImage ? `del-image:${d.delImage}`
+    : t.id === "reset" ? "reset" : null;
   if (confirmKey && pendingConfirm !== confirmKey) {
     pendingConfirm = confirmKey;
     render();
@@ -560,7 +731,19 @@ view.addEventListener("click", (e) => {
   }
   pendingConfirm = null;
 
-  if (d.goto) { currentTab = d.goto; render(); window.scrollTo(0, 0); }
+  if (d.open) openDetail(d.open);
+  else if (d.back) closeDetail();
+  else if (d.pickImages) document.getElementById("image-input").click();
+  else if (d.viewImage) {
+    lightbox.querySelector("img").src = d.viewImage;
+    lightbox.showModal();
+  } else if (d.delImage) {
+    const { ch } = findItem(currentDetail);
+    deleteImage(d.delImage).then(() => {
+      ch.imageCount = Math.max(0, ch.imageCount - 1);
+      save(); render();
+    });
+  } else if (d.goto) { currentTab = d.goto; window.scrollTo(0, 0); render(); }
   else if (d.review) review(d.review, d.ok === "1");
   else if (d.ue) { currentUe = d.ue; inlineEdit = null; render(); }
   else if (t.id === "toggle-edit") { editMode = !editMode; inlineEdit = null; render(); }
@@ -571,7 +754,9 @@ view.addEventListener("click", (e) => {
     const { ue, ch, parent } = findItem(d.delete);
     if (parent) parent.children = parent.children.filter((c) => c.id !== ch.id);
     else ue.chapters = ue.chapters.filter((c) => c.id !== ch.id);
-    removeFromPlanning([ch.id, ...ch.children.map((c) => c.id)]);
+    const ids = [ch.id, ...ch.children.map((c) => c.id)];
+    removeFromPlanning(ids);
+    deleteImagesFor(ids);
     save(); render();
   } else if (d.delAnnale) {
     state.annales = state.annales.filter((a) => a.id !== d.delAnnale);
@@ -581,18 +766,16 @@ view.addEventListener("click", (e) => {
     state.planning[day] = state.planning[day].filter((x) => x !== id);
     save(); render();
   } else if (t.id === "export") {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `revisions-dscg-${todayISO()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    exportData();
   } else if (t.id === "import-btn") {
     document.getElementById("import").click();
   } else if (t.id === "reset") {
     state = defaultState();
-    save(); render();
-    showFeedback("Toutes les données ont été effacées.");
+    save();
+    clearImages().then(() => {
+      render();
+      showFeedback("Toutes les données ont été effacées.");
+    });
   } else if (hadPending) render();
 });
 
@@ -607,24 +790,86 @@ function showFeedback(text) {
   if (el) el.textContent = text;
 }
 
+// La sauvegarde embarque les images, encodées en texte, pour être complète.
+async function exportData() {
+  showFeedback("Préparation de la sauvegarde…");
+  const images = await Promise.all((await allImages()).map(async (img) => ({
+    id: img.id,
+    chapterId: img.chapterId,
+    createdAt: img.createdAt,
+    data: await blobToDataUrl(img.blob),
+  })));
+  const blob = new Blob([JSON.stringify({ ...state, images }, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `revisions-dscg-${todayISO()}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showFeedback(`Sauvegarde exportée (${images.length} image${images.length > 1 ? "s" : ""}).`);
+}
+
+async function importData(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    if (!Array.isArray(data.ues) || !Array.isArray(data.annales) || !Array.isArray(data.planning)) throw new Error("format");
+    const images = data.images || [];
+    delete data.images;
+    await clearImages();
+    for (const img of images) {
+      const blob = await (await fetch(img.data)).blob();
+      await putImage({ id: img.id, chapterId: img.chapterId, createdAt: img.createdAt || Date.now(), blob });
+    }
+    state = normalize(data);
+    save(); render();
+    showFeedback("Sauvegarde importée.");
+  } catch {
+    showFeedback("Ce fichier n'est pas une sauvegarde valide.");
+  }
+}
+
+async function addImages(chapterId, files) {
+  const { ch } = findItem(chapterId);
+  const gallery = document.getElementById("gallery");
+  if (gallery) gallery.insertAdjacentHTML("afterbegin", '<p class="muted" id="adding">Ajout en cours…</p>');
+  let added = 0;
+  for (const file of files) {
+    try {
+      const blob = await compressImage(file);
+      await putImage({ id: uid(), chapterId, createdAt: Date.now() + added, blob });
+      added++;
+    } catch (e) {
+      console.warn("Image ignorée", file.name, e);
+    }
+  }
+  ch.imageCount += added;
+  save(); render();
+}
+
+let notesTimer = null;
+view.addEventListener("input", (e) => {
+  const t = e.target;
+  if (!t.dataset.notes) return;
+  const { ch } = findItem(t.dataset.notes);
+  ch.notes = t.value;
+  const stateEl = document.getElementById("save-state");
+  stateEl.textContent = "…";
+  clearTimeout(notesTimer);
+  notesTimer = setTimeout(() => {
+    save();
+    stateEl.textContent = "Enregistré";
+  }, 400);
+});
+
 view.addEventListener("change", (e) => {
   const t = e.target;
   if (t.dataset.status) setStatus(t.dataset.status, t.value);
   else if (t.dataset.exam) {
     findUe(t.dataset.exam).examDate = t.value;
     save();
+  } else if (t.dataset.addImages && t.files.length) {
+    addImages(t.dataset.addImages, [...t.files]);
   } else if (t.id === "import" && t.files[0]) {
-    t.files[0].text().then((txt) => {
-      try {
-        const data = JSON.parse(txt);
-        if (!Array.isArray(data.ues) || !Array.isArray(data.annales) || !Array.isArray(data.planning)) throw new Error("format");
-        state = normalize(data);
-        save(); render();
-        showFeedback("Sauvegarde importée.");
-      } catch {
-        showFeedback("Ce fichier n'est pas une sauvegarde valide.");
-      }
-    });
+    importData(t.files[0]);
   }
 });
 
@@ -673,5 +918,8 @@ view.addEventListener("submit", (e) => {
   save();
   render();
 });
+
+// Demande au navigateur de ne pas purger les données (notes et images) en cas de manque d'espace.
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
 
 render();
