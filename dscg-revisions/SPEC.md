@@ -37,7 +37,20 @@ Un appui sur le titre d'un chapitre ou d'un sous-chapitre ouvre sa fiche :
 - **Images** : photos, schémas ou captures, compressées à l'ajout (1600 px max) et
   stockées dans IndexedDB. Un appui agrandit l'image ; suppression en deux appuis.
 - La liste signale les chapitres qui ont des observations ou des images.
+- Sur ordinateur, les images peuvent être glissées-déposées dans la fiche ou collées (⌘V).
+- **Questions** : paires question/réponse par chapitre. « S'entraîner » les présente
+  dans un ordre aléatoire (réponse masquée, puis « Je savais » / « À revoir »), avec un
+  bilan et la possibilité de revoir les ratées. Un entraînement par UE regroupe toutes
+  ses questions.
 - L'export JSON inclut les images ; supprimer un chapitre supprime ses images.
+
+### Recherche
+Un champ en haut du programme cherche dans toutes les UE : titres, observations,
+questions et réponses, sans tenir compte des accents. Un résultat ouvre la fiche.
+
+### Rappel de sauvegarde
+Dès qu'il y a des données, l'accueil rappelle d'exporter si la dernière sauvegarde date
+de plus de 7 jours (ou n'a jamais été faite).
 
 ### 2. Révision espacée
 - Passer un chapitre en « Acquis » programme une première révision à J+1.

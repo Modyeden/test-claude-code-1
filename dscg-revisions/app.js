@@ -18,6 +18,8 @@ const ICONS = {
   chevron: '<path d="M9 6l6 6-6 6"/>',
   back: '<path d="M15 6l-6 6 6 6"/>',
   note: '<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13h7M9 17h5"/>',
+  search: '<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',
+  close: '<path d="M6 6l12 12M18 6L6 18"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -118,7 +120,7 @@ function esc(str) {
 
 // ---------- Données ----------
 
-const newItem = (title) => ({ id: uid(), title, status: "nonvu", step: 0, nextReview: "", notes: "", imageCount: 0, children: [] });
+const newItem = (title) => ({ id: uid(), title, status: "nonvu", step: 0, nextReview: "", notes: "", imageCount: 0, cards: [], children: [] });
 
 function defaultState() {
   return {
@@ -138,7 +140,9 @@ function normalize(data) {
   const fill = (item) => {
     item.notes = item.notes || "";
     item.imageCount = item.imageCount || 0;
+    item.cards = item.cards || [];
   };
+  data.lastExport = data.lastExport || "";
   for (const ue of data.ues) {
     for (const ch of ue.chapters) {
       fill(ch);
@@ -241,6 +245,9 @@ let pendingConfirm = null;
 // Chapitre dont la fiche (observations et images) est ouverte.
 let currentDetail = null;
 let galleryUrls = [];
+let searchQuery = "";
+// Session d'entraînement en cours : { items, i, shown, ok, wrong }.
+let quiz = null;
 const openGroups = new Set();
 
 const findUe = (code) => state.ues.find((u) => u.code === code);
@@ -370,6 +377,7 @@ function viewDashboard() {
 
   return `
     <p class="greeting">Bonjour, Mody</p>
+    ${backupReminder()}
     <div class="dash">
       <section class="panel primary">
         <h2>À réviser (${due.length})</h2>
@@ -384,6 +392,26 @@ function viewDashboard() {
         <ul class="list">${exams}</ul>
       </section>
     </div>`;
+}
+
+function hasUserData() {
+  let found = state.annales.length > 0;
+  forEachItem((ue, ch) => {
+    if (ch.status !== "nonvu" || ch.notes.trim() || ch.imageCount || ch.cards.length) found = true;
+  });
+  return found;
+}
+
+// Les données ne vivent que sur l'appareil : on rappelle d'exporter chaque semaine.
+function backupReminder() {
+  if (!hasUserData()) return "";
+  const age = state.lastExport ? daysBetween(state.lastExport, todayISO()) : null;
+  if (age !== null && age < 7) return "";
+  return `<div class="notice" role="status">
+    <div><strong>Pensez à sauvegarder</strong>
+      <p>${age === null ? "Vous n'avez encore jamais exporté vos données." : `Dernière sauvegarde il y a ${age} jours.`} Elles ne sont enregistrées que sur cet appareil.</p></div>
+    <button class="btn" id="export">Exporter</button>
+  </div>`;
 }
 
 function deleteButton(attr, id, name) {
@@ -423,6 +451,7 @@ function attachmentHint(ch) {
   const parts = [];
   if (ch.notes.trim()) parts.push("Observations");
   if (ch.imageCount) parts.push(`${ch.imageCount} image${ch.imageCount > 1 ? "s" : ""}`);
+  if (ch.cards.length) parts.push(`${ch.cards.length} question${ch.cards.length > 1 ? "s" : ""}`);
   return parts.length ? `<span class="hint">${icon("note")}${parts.join(" · ")}</span>` : "";
 }
 
@@ -475,13 +504,112 @@ function viewDetail(found) {
       <div class="panel-head"><h2><label for="notes">Observations</label></h2><span class="muted save-state" id="save-state" aria-live="polite"></span></div>
       <textarea id="notes" data-notes="${ch.id}" rows="6" placeholder="Points clés, pièges, références d'articles, questions à reposer…">${esc(ch.notes)}</textarea>
     </section>
-    <section>
+    <section class="dropzone">
       <div class="panel-head">
         <h2>Images</h2>
         <button class="btn ghost" data-pick-images="1">${icon("plus")}Ajouter</button>
         <input type="file" id="image-input" data-add-images="${ch.id}" accept="image/*" multiple hidden>
       </div>
-      <div class="gallery" id="gallery" data-chapter="${ch.id}"><p class="muted">Chargement…</p></div>
+      <p class="muted drop-hint">Glissez des images ici, ou collez une capture avec ⌘V.</p>
+      <div class="gallery" id="gallery" data-chapter="${ch.id}">${ch.imageCount ? '<p class="muted">Chargement…</p>' : `<p class="muted">${EMPTY_GALLERY}</p>`}</div>
+    </section>
+    <section>
+      <div class="panel-head">
+        <h2>Questions</h2>
+        ${ch.cards.length ? `<button class="btn" data-quiz="chapter">S'entraîner</button>` : ""}
+      </div>
+      ${ch.cards.length ? `<ul class="list cards">${ch.cards.map((c) => `<li class="item">
+          <div class="title"><strong>${esc(c.q)}</strong><small class="answer">${esc(c.a)}</small></div>
+          ${deleteButton("del-card", c.id, c.q)}
+        </li>`).join("")}</ul>` : '<p class="muted">Écrivez les questions que l\'examinateur pourrait poser, puis entraînez-vous à y répondre.</p>'}
+      <form id="add-card" class="card-form">
+        <input name="q" placeholder="Question" required aria-label="Question">
+        <textarea name="a" rows="2" placeholder="Réponse attendue" required aria-label="Réponse"></textarea>
+        <button class="btn ghost" type="submit">${icon("plus")}Ajouter la question</button>
+      </form>
+    </section>`;
+}
+
+// ---------- Recherche ----------
+
+// Compare sans tenir compte des accents ni de la casse ; la longueur du texte est conservée.
+const fold = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().normalize("NFC");
+
+function snippet(text, query) {
+  const pos = fold(text).indexOf(query);
+  const start = Math.max(0, pos - 40);
+  const end = Math.min(text.length, pos + query.length + 60);
+  return `${start > 0 ? "…" : ""}${esc(text.slice(start, pos))}<mark>${esc(text.slice(pos, pos + query.length))}</mark>${esc(text.slice(pos + query.length, end))}${end < text.length ? "…" : ""}`;
+}
+
+function searchResults() {
+  const q = fold(searchQuery.trim());
+  const results = [];
+  forEachItem((ue, ch, parent) => {
+    const f = { ue, ch, parent };
+    const title = label(f);
+    const sources = [ch.notes, ...ch.cards.flatMap((c) => [c.q, c.a])];
+    const hit = sources.find((s) => fold(s).includes(q));
+    if (fold(title).includes(q) || hit) {
+      results.push(`<li class="item">${isLeaf(ch) ? statusDot(ch.status) : ""}
+        <button class="title title-btn" data-open="${ch.id}"><span class="ue">${ue.code}</span> ${fold(title).includes(q) ? snippet(title, q) : esc(title)}
+          ${hit ? `<small>${snippet(hit, q)}</small>` : ""}</button></li>`);
+    }
+  });
+  return `<section>
+    <h2>${results.length} résultat${results.length > 1 ? "s" : ""}</h2>
+    <ul class="list">${results.join("") || emptyRow("Aucun chapitre, observation ou question ne correspond.")}</ul>
+  </section>`;
+}
+
+// ---------- Entraînement ----------
+
+function startQuiz(items) {
+  // Mélange de Fisher-Yates pour ne pas réviser toujours dans le même ordre.
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
+  quiz = { items, i: 0, shown: false, ok: 0, wrong: [] };
+  window.scrollTo(0, 0);
+  render();
+}
+
+function quizItemsFor(chapterId, ueCode) {
+  const items = [];
+  forEachItem((ue, ch, parent) => {
+    if (chapterId ? ch.id === chapterId : ue.code === ueCode) {
+      for (const card of ch.cards) items.push({ ue, ch, parent, card });
+    }
+  });
+  return items;
+}
+
+function viewQuiz() {
+  const { items, i } = quiz;
+  if (i >= items.length) {
+    return `<section class="quiz">
+      <h2>Entraînement terminé</h2>
+      <p class="quiz-score"><span class="num">${quiz.ok}</span> / ${items.length} réponses sues</p>
+      <div class="actions start">
+        ${quiz.wrong.length ? `<button class="btn" data-quiz-retry="1">${quiz.wrong.length > 1 ? `Revoir les ${quiz.wrong.length} questions ratées` : "Revoir la question ratée"}</button>` : ""}
+        <button class="btn ghost" data-quiz-end="1">Terminer</button>
+      </div>
+    </section>`;
+  }
+  const item = items[i];
+  return `<button class="back" data-quiz-end="1">${icon("back")}Arrêter</button>
+    <section class="quiz">
+      <div class="panel-head"><span class="muted">${item.ue.code} · ${esc(label(item))}</span><span class="muted num">${i + 1} / ${items.length}</span></div>
+      <div class="bar"><span style="width:${Math.round((i / items.length) * 100)}%"></span></div>
+      <p class="quiz-question">${esc(item.card.q)}</p>
+      ${quiz.shown
+        ? `<p class="quiz-answer">${esc(item.card.a)}</p>
+           <div class="actions start">
+             <button class="btn" data-quiz-answer="1">Je savais</button>
+             <button class="btn ghost" data-quiz-answer="0">À revoir</button>
+           </div>`
+        : `<button class="btn" data-quiz-show="1">Afficher la réponse</button>`}
     </section>`;
 }
 
@@ -499,18 +627,32 @@ async function loadGallery() {
         <button class="thumb" data-view-image="${galleryUrls[i]}" aria-label="Agrandir l'image ${i + 1}"><img src="${galleryUrls[i]}" alt="Image ${i + 1}"></button>
         ${deleteButton("del-image", img.id, `l'image ${i + 1}`)}
       </figure>`).join("")
-    : '<p class="muted">Ajoutez des photos de cours, schémas ou captures d\'écran liés à cette partie.</p>';
+    : `<p class="muted">${EMPTY_GALLERY}</p>`;
 }
 
+const EMPTY_GALLERY = "Ajoutez des photos de cours, schémas ou captures d'écran liés à cette partie.";
+
 function viewUe() {
+  if (quiz) return viewQuiz();
   if (currentDetail) {
     const found = findItem(currentDetail);
     if (found) return viewDetail(found);
     currentDetail = null;
   }
+  return `
+    <div class="search">
+      ${icon("search")}
+      <input type="search" id="search" value="${esc(searchQuery)}" placeholder="Rechercher un chapitre, une observation, une question" aria-label="Rechercher dans le programme">
+      <button class="clear-search" id="clear-search" aria-label="Effacer la recherche" ${searchQuery ? "" : "hidden"}>${icon("close")}</button>
+    </div>
+    <div id="ue-body">${searchQuery.trim() ? searchResults() : ueList()}</div>`;
+}
+
+function ueList() {
   const ue = findUe(currentUe);
   const items = leaves(ue);
   const p = progress(items);
+  const cardCount = quizItemsFor(null, ue.code).length;
   const tabs = state.ues
     .map((u) => `<button role="tab" aria-selected="${u.code === currentUe}" data-ue="${u.code}">${u.code}</button>`)
     .join("");
@@ -522,7 +664,10 @@ function viewUe() {
     <section>
       <div class="ue-head">
         <h2>${esc(ue.name)}</h2>
-        <button class="btn ghost" id="toggle-edit">${editMode ? "Terminer" : "Modifier"}</button>
+        <div class="actions">
+          ${cardCount && !editMode ? `<button class="btn ghost" data-quiz="ue">S'entraîner (${cardCount})</button>` : ""}
+          <button class="btn ghost" id="toggle-edit">${editMode ? "Terminer" : "Modifier"}</button>
+        </div>
       </div>
       <div class="bar"><span style="width:${p}%"></span></div>
       <p class="muted summary">${items.filter((c) => c.status === "acquis").length} acquis sur ${items.length} · ${p} %</p>
@@ -626,7 +771,8 @@ function viewSettings() {
     </section>
     <section>
       <h2>Sauvegarde</h2>
-      <p class="muted">Vos données restent sur cet appareil. Exportez-les régulièrement pour ne rien perdre.</p>
+      <p class="muted">Vos données restent sur cet appareil. Exportez-les régulièrement pour ne rien perdre.
+        ${state.lastExport ? `Dernière sauvegarde : ${formatDate(state.lastExport)}.` : "Aucune sauvegarde pour l'instant."}</p>
       <div class="inline-form">
         <button class="btn" id="export">Exporter</button>
         <button class="btn ghost" id="import-btn">Importer</button>
@@ -692,6 +838,7 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
   if (!btn) return;
   currentTab = btn.dataset.tab;
   currentDetail = null;
+  quiz = null;
   editMode = false;
   inlineEdit = null;
   pendingConfirm = null;
@@ -723,6 +870,7 @@ view.addEventListener("click", (e) => {
   const confirmKey = d.delete ? `delete:${d.delete}`
     : d.delAnnale ? `del-annale:${d.delAnnale}`
     : d.delImage ? `del-image:${d.delImage}`
+    : d.delCard ? `del-card:${d.delCard}`
     : t.id === "reset" ? "reset" : null;
   if (confirmKey && pendingConfirm !== confirmKey) {
     pendingConfirm = confirmKey;
@@ -731,7 +879,26 @@ view.addEventListener("click", (e) => {
   }
   pendingConfirm = null;
 
-  if (d.open) openDetail(d.open);
+  if (t.id === "clear-search") {
+    const input = document.getElementById("search");
+    input.value = "";
+    updateSearch("");
+    input.focus();
+  } else if (d.quiz) startQuiz(d.quiz === "chapter" ? quizItemsFor(currentDetail) : quizItemsFor(null, currentUe));
+  else if (d.quizShow) { quiz.shown = true; render(); }
+  else if (d.quizAnswer) {
+    if (d.quizAnswer === "1") quiz.ok++;
+    else quiz.wrong.push(quiz.items[quiz.i]);
+    quiz.i++;
+    quiz.shown = false;
+    render();
+  } else if (d.quizRetry) startQuiz(quiz.wrong);
+  else if (d.quizEnd) { quiz = null; render(); }
+  else if (d.delCard) {
+    const { ch } = findItem(currentDetail);
+    ch.cards = ch.cards.filter((c) => c.id !== d.delCard);
+    save(); render();
+  } else if (d.open) openDetail(d.open);
   else if (d.back) closeDetail();
   else if (d.pickImages) document.getElementById("image-input").click();
   else if (d.viewImage) {
@@ -805,6 +972,9 @@ async function exportData() {
   a.download = `revisions-dscg-${todayISO()}.json`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  state.lastExport = todayISO();
+  save();
+  render();
   showFeedback(`Sauvegarde exportée (${images.length} image${images.length > 1 ? "s" : ""}).`);
 }
 
@@ -845,9 +1015,57 @@ async function addImages(chapterId, files) {
   save(); render();
 }
 
+// ---------- Dépôt et collage d'images ----------
+
+const imageFiles = (list) => [...(list || [])].filter((f) => f.type.startsWith("image/"));
+const canReceiveImages = () => currentTab === "ue" && currentDetail && !quiz;
+
+// Empêche le navigateur d'ouvrir un fichier lâché à côté de la zone.
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+
+view.addEventListener("dragover", (e) => {
+  const zone = e.target.closest(".dropzone");
+  if (!zone) return;
+  e.dataTransfer.dropEffect = "copy";
+  zone.classList.add("dragging");
+});
+
+view.addEventListener("dragleave", (e) => {
+  const zone = e.target.closest(".dropzone");
+  if (zone && !zone.contains(e.relatedTarget)) zone.classList.remove("dragging");
+});
+
+view.addEventListener("drop", (e) => {
+  const zone = e.target.closest(".dropzone");
+  if (!zone) return;
+  zone.classList.remove("dragging");
+  const files = imageFiles(e.dataTransfer.files);
+  if (files.length && canReceiveImages()) addImages(currentDetail, files);
+});
+
+document.addEventListener("paste", (e) => {
+  if (!canReceiveImages()) return;
+  const files = imageFiles([...e.clipboardData.items].map((i) => i.getAsFile()).filter(Boolean));
+  if (!files.length) return;
+  // Une image collée va dans la galerie, pas dans le champ de texte.
+  e.preventDefault();
+  addImages(currentDetail, files);
+});
+
+function updateSearch(value) {
+  searchQuery = value;
+  document.getElementById("clear-search").hidden = !searchQuery;
+  document.getElementById("ue-body").innerHTML = searchQuery.trim() ? searchResults() : ueList();
+}
+
 let notesTimer = null;
 view.addEventListener("input", (e) => {
   const t = e.target;
+  if (t.id === "search") {
+    updateSearch(t.value);
+    return;
+  }
   if (!t.dataset.notes) return;
   const { ch } = findItem(t.dataset.notes);
   ch.notes = t.value;
@@ -899,6 +1117,15 @@ view.addEventListener("submit", (e) => {
       renderAndFocus();
       return;
     }
+  } else if (f.id === "add-card") {
+    const q = data.get("q").trim();
+    const a = data.get("a").trim();
+    if (!q || !a) return;
+    findItem(currentDetail).ch.cards.push({ id: uid(), q, a });
+    save();
+    render();
+    document.querySelector("#add-card input").focus();
+    return;
   } else if (f.id === "add-chapter") {
     findUe(currentUe).chapters.push(newItem(data.get("title").trim()));
   } else if (f.id === "add-annale") {
