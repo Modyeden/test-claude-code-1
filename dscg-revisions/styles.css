@@ -283,6 +283,12 @@ input[type="date"] { min-width: 150px; }
 select.status { min-height: 36px; padding: 4px 10px; font-size: .85rem; color: var(--muted); }
 
 .inline-form { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.inline-edit { padding: 4px 0 14px; border-top: 1px solid var(--line); }
+.inline-edit.sub { padding-left: 28px; }
+.inline-edit .inline-form { margin-top: 10px; }
+.btn.small { min-height: 40px; padding: 6px 12px; font-size: .85rem; }
+.feedback { margin: 10px 0 0; color: var(--muted); }
+.feedback:empty { display: none; }
 .inline-form input, .inline-form select { flex: 1 1 200px; }
 
 .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }

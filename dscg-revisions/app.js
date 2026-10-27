@@ -164,6 +164,10 @@ let state = load();
 let currentTab = "dashboard";
 let currentUe = "UE1";
 let editMode = false;
+// Saisie en cours dans la page : { type: "sub" | "rename", id }.
+let inlineEdit = null;
+// Bouton de suppression en attente d'un second appui de confirmation.
+let pendingConfirm = null;
 const openGroups = new Set();
 
 const findUe = (code) => state.ues.find((u) => u.code === code);
@@ -309,16 +313,40 @@ function viewDashboard() {
     </div>`;
 }
 
+function deleteButton(attr, id, name) {
+  const key = `${attr}:${id}`;
+  if (pendingConfirm === key) {
+    return `<button class="btn danger small" data-${attr}="${id}" data-confirmed="1">Supprimer ?</button>`;
+  }
+  return `<button class="icon-btn danger" data-${attr}="${id}" aria-label="Supprimer ${esc(name)}">${icon("trash")}</button>`;
+}
+
 function editActions(ch, parent) {
   if (!editMode) return "";
   return `<div class="actions">
     ${parent ? "" : `<button class="icon-btn" data-add-sub="${ch.id}" aria-label="Ajouter un sous-chapitre à ${esc(ch.title)}">${icon("plus")}</button>`}
     <button class="icon-btn" data-rename="${ch.id}" aria-label="Renommer ${esc(ch.title)}">${icon("edit")}</button>
-    <button class="icon-btn danger" data-delete="${ch.id}" aria-label="Supprimer ${esc(ch.title)}">${icon("trash")}</button>
+    ${deleteButton("delete", ch.id, ch.title)}
   </div>`;
 }
 
+function inlineForm(type, ch) {
+  const isSub = type === "sub";
+  return `<li class="inline-edit${isSub ? " sub" : ""}">
+    <form class="inline-form" data-inline="${type}" data-id="${ch.id}">
+      <input name="title" required autofocus value="${isSub ? "" : esc(ch.title)}"
+        placeholder="${isSub ? "Titre du sous-chapitre" : "Nouveau titre"}"
+        aria-label="${isSub ? `Nouveau sous-chapitre de ${esc(ch.title)}` : `Nouveau titre pour ${esc(ch.title)}`}">
+      <button class="btn" type="submit">${isSub ? "Ajouter" : "Renommer"}</button>
+      <button class="btn ghost" type="button" data-cancel-inline="1">Annuler</button>
+    </form>
+  </li>`;
+}
+
+const isEditing = (type, ch) => inlineEdit && inlineEdit.type === type && inlineEdit.id === ch.id;
+
 function leafRow(ch, parent) {
+  if (isEditing("rename", ch)) return inlineForm("rename", ch);
   return `<li class="item${parent ? " sub" : ""}">
     ${statusDot(ch.status)}
     <div class="title">${esc(ch.title)}
@@ -326,19 +354,20 @@ function leafRow(ch, parent) {
     ${editMode ? editActions(ch, parent) : `<select class="status" data-status="${ch.id}" aria-label="Statut de ${esc(ch.title)}">
       ${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}" ${k === ch.status ? "selected" : ""}>${v}</option>`).join("")}
     </select>`}
-  </li>`;
+  </li>${isEditing("sub", ch) ? inlineForm("sub", ch) : ""}`;
 }
 
 function groupRow(ch) {
   const done = ch.children.filter((c) => c.status === "acquis").length;
   return `<li class="group">
+    ${isEditing("rename", ch) ? `<ul class="list">${inlineForm("rename", ch)}</ul>` : ""}
     <details data-group="${ch.id}" ${openGroups.has(ch.id) ? "open" : ""}>
-      <summary class="item">
+      <summary class="item"${isEditing("rename", ch) ? " hidden" : ""}>
         <span class="chevron">${icon("chevron")}</span>
         <div class="title">${esc(ch.title)}</div>
         ${editMode ? editActions(ch, null) : `<span class="muted num">${done}/${ch.children.length}</span>`}
       </summary>
-      <ul class="list">${ch.children.map((sub) => leafRow(sub, ch)).join("")}</ul>
+      <ul class="list">${ch.children.map((sub) => leafRow(sub, ch)).join("")}${isEditing("sub", ch) ? inlineForm("sub", ch) : ""}</ul>
     </details>
   </li>`;
 }
@@ -400,7 +429,7 @@ function viewAnnales() {
     <li class="item">
       <div class="title"><span class="ue">${a.ue}</span> ${esc(a.title)}<small>${formatDate(a.date)}</small></div>
       <span class="num score">${String(a.score).replace(".", ",")}</span>
-      <button class="icon-btn danger" data-del-annale="${a.id}" aria-label="Supprimer ${esc(a.title)}">${icon("trash")}</button>
+      ${deleteButton("del-annale", a.id, a.title)}
     </li>`).join("");
 
   return `
@@ -471,7 +500,8 @@ function viewSettings() {
     </section>
     <section>
       <h2>Réinitialisation</h2>
-      <button class="btn danger" id="reset">Effacer toutes les données</button>
+      <button class="btn danger" id="reset">${pendingConfirm === "reset" ? "Confirmer l'effacement définitif" : "Effacer toutes les données"}</button>
+      <p class="feedback" id="feedback" role="status"></p>
     </section>`;
 }
 
@@ -495,6 +525,8 @@ document.querySelector(".tabs").addEventListener("click", (e) => {
   if (!btn) return;
   currentTab = btn.dataset.tab;
   editMode = false;
+  inlineEdit = null;
+  pendingConfirm = null;
   render();
   window.scrollTo(0, 0);
 });
@@ -515,36 +547,33 @@ view.addEventListener("click", (e) => {
   if (t.closest("summary")) e.preventDefault();
   const d = t.dataset;
 
+  // Re-rendre ici retirerait le formulaire du DOM et annulerait son envoi.
+  if (t.type === "submit" && t.form) return;
+
+  // Les suppressions demandent un second appui : le bouton devient « Supprimer ? ».
+  const hadPending = pendingConfirm;
+  const confirmKey = d.delete ? `delete:${d.delete}` : d.delAnnale ? `del-annale:${d.delAnnale}` : t.id === "reset" ? "reset" : null;
+  if (confirmKey && pendingConfirm !== confirmKey) {
+    pendingConfirm = confirmKey;
+    render();
+    return;
+  }
+  pendingConfirm = null;
+
   if (d.goto) { currentTab = d.goto; render(); window.scrollTo(0, 0); }
   else if (d.review) review(d.review, d.ok === "1");
-  else if (d.ue) { currentUe = d.ue; render(); }
-  else if (t.id === "toggle-edit") { editMode = !editMode; render(); }
-  else if (d.addSub) {
-    const { ch } = findItem(d.addSub);
-    const title = prompt(`Nouveau sous-chapitre de « ${ch.title} »`);
-    if (!title || !title.trim()) return;
-    if (isLeaf(ch)) {
-      // Le chapitre devient un regroupement : son suivi passe aux sous-chapitres.
-      Object.assign(ch, { status: "nonvu", step: 0, nextReview: "" });
-      removeFromPlanning([ch.id]);
-    }
-    ch.children.push(newItem(title.trim()));
-    openGroups.add(ch.id);
-    save(); render();
-  } else if (d.rename) {
-    const { ch } = findItem(d.rename);
-    const title = prompt("Nouveau titre", ch.title);
-    if (title && title.trim()) { ch.title = title.trim(); save(); render(); }
-  } else if (d.delete) {
+  else if (d.ue) { currentUe = d.ue; inlineEdit = null; render(); }
+  else if (t.id === "toggle-edit") { editMode = !editMode; inlineEdit = null; render(); }
+  else if (d.addSub) { inlineEdit = { type: "sub", id: d.addSub }; openGroups.add(d.addSub); renderAndFocus(); }
+  else if (d.rename) { inlineEdit = { type: "rename", id: d.rename }; renderAndFocus(); }
+  else if (d.cancelInline) { inlineEdit = null; render(); }
+  else if (d.delete) {
     const { ue, ch, parent } = findItem(d.delete);
-    const extra = ch.children.length ? ` et ses ${ch.children.length} sous-chapitre(s)` : "";
-    if (!confirm(`Supprimer « ${ch.title} »${extra} ?`)) return;
     if (parent) parent.children = parent.children.filter((c) => c.id !== ch.id);
     else ue.chapters = ue.chapters.filter((c) => c.id !== ch.id);
     removeFromPlanning([ch.id, ...ch.children.map((c) => c.id)]);
     save(); render();
   } else if (d.delAnnale) {
-    if (!confirm("Supprimer cette note ?")) return;
     state.annales = state.annales.filter((a) => a.id !== d.delAnnale);
     save(); render();
   } else if (d.unplan) {
@@ -561,11 +590,22 @@ view.addEventListener("click", (e) => {
   } else if (t.id === "import-btn") {
     document.getElementById("import").click();
   } else if (t.id === "reset") {
-    if (!confirm("Effacer toutes les données ? Cette action est irréversible.")) return;
     state = defaultState();
     save(); render();
-  }
+    showFeedback("Toutes les données ont été effacées.");
+  } else if (hadPending) render();
 });
+
+function renderAndFocus() {
+  render();
+  const input = view.querySelector(".inline-edit input");
+  if (input) { input.focus(); input.select(); }
+}
+
+function showFeedback(text) {
+  const el = document.getElementById("feedback");
+  if (el) el.textContent = text;
+}
 
 view.addEventListener("change", (e) => {
   const t = e.target;
@@ -578,12 +618,11 @@ view.addEventListener("change", (e) => {
       try {
         const data = JSON.parse(txt);
         if (!Array.isArray(data.ues) || !Array.isArray(data.annales) || !Array.isArray(data.planning)) throw new Error("format");
-        if (!confirm("Remplacer les données actuelles par celles du fichier ?")) return;
         state = normalize(data);
         save(); render();
-        alert("Import réussi.");
+        showFeedback("Sauvegarde importée.");
       } catch {
-        alert("Ce fichier n'est pas une sauvegarde valide.");
+        showFeedback("Ce fichier n'est pas une sauvegarde valide.");
       }
     });
   }
@@ -591,10 +630,31 @@ view.addEventListener("change", (e) => {
 
 view.addEventListener("submit", (e) => {
   e.preventDefault();
+  pendingConfirm = null;
   const f = e.target;
   const data = new FormData(f);
 
-  if (f.id === "add-chapter") {
+  if (f.dataset.inline) {
+    const { ch } = findItem(f.dataset.id);
+    const title = data.get("title").trim();
+    if (!title) return;
+    if (f.dataset.inline === "rename") {
+      ch.title = title;
+      inlineEdit = null;
+    } else {
+      if (isLeaf(ch)) {
+        // Le chapitre devient un regroupement : son suivi passe aux sous-chapitres.
+        Object.assign(ch, { status: "nonvu", step: 0, nextReview: "" });
+        removeFromPlanning([ch.id]);
+      }
+      ch.children.push(newItem(title));
+      openGroups.add(ch.id);
+      // Le champ reste ouvert pour enchaîner plusieurs sous-chapitres.
+      save();
+      renderAndFocus();
+      return;
+    }
+  } else if (f.id === "add-chapter") {
     findUe(currentUe).chapters.push(newItem(data.get("title").trim()));
   } else if (f.id === "add-annale") {
     state.annales.push({
